@@ -133,7 +133,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 		lcResp, err := leetcodeClient.RandomQuestion(difficulty)
 		if err != nil {
-			logger.Error("failed to retrieve leetcode question")
+			logger.Error("failed to retrieve leetcode question", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
