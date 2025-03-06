@@ -17,6 +17,21 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/google/uuid"
 	"github.com/sudomateo/yeetcode/internal/leetcode"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var tracer = otel.GetTracerProvider().Tracer(
+	"github.com/sudomateo/yeetcode",
+	trace.WithSchemaURL(semconv.SchemaURL),
 )
 
 func main() {
@@ -29,6 +44,43 @@ func main() {
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
+	var exporter sdktrace.SpanExporter
+
+	axiomApiToken := os.Getenv("AXIOM_API_TOKEN")
+	if axiomApiToken == "" {
+		stdoutExp, err := stdouttrace.New()
+		if err != nil {
+			return fmt.Errorf("failed initializing stdout exporter: %w", err)
+		}
+		exporter = stdoutExp
+	} else {
+		httpExp, err := otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint("api.axiom.co"),
+			otlptracehttp.WithHeaders(map[string]string{
+				"Authorization":   fmt.Sprintf("Bearer %s", axiomApiToken),
+				"X-AXIOM-DATASET": "yeetcode",
+			}),
+		)
+		if err != nil {
+			return fmt.Errorf("failed initializing trace exporter: %w", err)
+		}
+		exporter = httpExp
+	}
+
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName("yeetcode"),
+		)),
+	)
+
+	defer func() {
+		_ = tracerProvider.Shutdown(ctx)
+	}()
+
+	otel.SetTracerProvider(tracerProvider)
+
 	discordToken := os.Getenv("DISCORD_TOKEN")
 	if discordToken == "" {
 		return errors.New("DISCORD_TOKEN must be provided")
@@ -53,27 +105,28 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /", func(w http.ResponseWriter, r *http.Request) {
+	handleFunc := func(pattern string, handlerFunc func(http.ResponseWriter, *http.Request)) {
+		handler := otelhttp.WithRouteTag(pattern, http.HandlerFunc(handlerFunc))
+		mux.Handle(pattern, handler)
+	}
+
+	handleFunc("POST /", func(w http.ResponseWriter, r *http.Request) {
+		ctx, span := tracer.Start(r.Context(), "interaction")
+		defer span.End()
+
 		requestID, err := uuid.NewRandom()
 		if err != nil {
-			logger.Error("failed generating request id")
+			span.RecordError(err)
 			requestID = uuid.UUID([16]byte{})
 		}
 
-		logger := logger.With(
-			"request.path", r.URL.Path,
-			"request.id", requestID,
+		span.SetAttributes(
+			attribute.String("request.id", requestID.String()),
 		)
 
-		logger.Info("received request")
-
-		requestReceivedAt := time.Now()
-		defer func() {
-			logger.Info("finished handling request", "duration_ms", time.Since(requestReceivedAt).Milliseconds())
-		}()
-
 		if !discordgo.VerifyInteraction(r, publicKeyBytes) {
-			logger.Error("failed verifying interaction")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed verifying interaction")
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -81,7 +134,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		defer r.Body.Close()
 		var interaction discordgo.Interaction
 		if err := json.NewDecoder(r.Body).Decode(&interaction); err != nil {
-			logger.Error("invalid interaction payload", "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "invalid interaction payload")
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -93,7 +147,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			}
 
 			if err := json.NewEncoder(w).Encode(resp); err != nil {
-				logger.Error("failed sending ping response", "error", err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "failed sending ping response")
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
@@ -102,38 +157,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 
 		if interaction.Type != discordgo.InteractionApplicationCommand {
-			logger.Error("unsupported interaction type", "type", interaction.Type)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "unsupported interaction type")
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
 		applicationCommandData := interaction.ApplicationCommandData()
-
-		var difficultyOpt string
-
-		for _, v := range applicationCommandData.Options {
-			if v.Name == "difficulty" {
-				difficultyOpt = strings.ToUpper(v.StringValue())
-				break
-			}
-		}
-
-		var difficulty leetcode.Difficulty
-
-		switch leetcode.Difficulty(difficultyOpt) {
-		case leetcode.DifficultyEasy:
-			difficulty = leetcode.DifficultyEasy
-		case leetcode.DifficultyMedium:
-			difficulty = leetcode.DifficultyMedium
-		case leetcode.DifficultyHard:
-			difficulty = leetcode.DifficultyHard
-		default:
-			difficulty = leetcode.RandomDifficulty()
-		}
-
-		lcResp, err := leetcodeClient.RandomQuestion(difficulty)
+		lcResp, err := fetchLeetCodeQuestion(ctx, &leetcodeClient, &applicationCommandData)
 		if err != nil {
-			logger.Error("failed to retrieve leetcode question", "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed to retreive leetcode question")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -146,12 +180,15 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 
 		if err := discordClient.InteractionRespond(&interaction, &interactionResp); err != nil {
-			logger.Error("failed responding to interaction")
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "failed responding to interaction")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		logger.Info("responded to interaction", "leetcode", lcResp.Data.RandomQuestion.TitleSlug, "difficulty", difficulty)
+		span.SetAttributes(
+			attribute.String("leetcode.title_slug", lcResp.Data.RandomQuestion.TitleSlug),
+		)
 
 		w.WriteHeader(http.StatusOK)
 		return
@@ -187,4 +224,36 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	return nil
+}
+
+// This is just here to have a parent/child span relationship for Axiom.
+func fetchLeetCodeQuestion(ctx context.Context, leetcodeClient *leetcode.Client, applicationCommandData *discordgo.ApplicationCommandInteractionData) (leetcode.RandomQuestionResponse, error) {
+	ctx, span := tracer.Start(ctx, "fetchLeetCodeQuestion")
+	defer span.End()
+
+	var difficultyOpt string
+
+	for _, v := range applicationCommandData.Options {
+		if v.Name == "difficulty" {
+			difficultyOpt = strings.ToUpper(v.StringValue())
+			break
+		}
+	}
+
+	var difficulty leetcode.Difficulty
+
+	switch leetcode.Difficulty(difficultyOpt) {
+	case leetcode.DifficultyEasy:
+		difficulty = leetcode.DifficultyEasy
+	case leetcode.DifficultyMedium:
+		difficulty = leetcode.DifficultyMedium
+	case leetcode.DifficultyHard:
+		difficulty = leetcode.DifficultyHard
+	default:
+		difficulty = leetcode.RandomDifficulty()
+	}
+
+	span.SetAttributes(attribute.String("leetcode.difficulty", string(difficulty)))
+
+	return leetcodeClient.RandomQuestion(difficulty)
 }
