@@ -1,6 +1,6 @@
 module github.com/sudomateo/yeetcode
 
-go 1.24.4
+go 1.24.5
 
 require (
 	github.com/bwmarrin/discordgo v0.28.1
